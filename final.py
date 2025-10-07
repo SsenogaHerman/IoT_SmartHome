@@ -1,172 +1,163 @@
-import time
+import paho.mqtt.client as mqtt
 import json
 import requests
-import paho.mqtt.client as mqtt
-from datetime import datetime, timedelta
+import csv
+import os
+import boto3
+from datetime import datetime
 import pytz
-import threading
 
-# ================== CONFIGURATION ==================
-TTN_BROKER = "eu1.cloud.thethings.network"
-TTN_PORT = 1883
-TTN_USERNAME = "bd-test-app2@ttn"
-TTN_PASSWORD = "NNSXS.NGFSXX4UXDX55XRIDQZS6LPR4OJXKIIGSZS56CQ.6O4WUAUHFUAHSTEYRWJX6DDO7TL2IBLC7EV2LS4EHWZOOEPCEUOA"
-DEVICE_ID = "lht65n-01-temp-humidity-sensor"
-APP_ID = "bd-test-app2"
+# ================= CONFIGURATION =================
+broker = "eu1.cloud.thethings.network"
+port = 1883
+username = "bd-test-app2@ttn"
+password = "NNSXS.NGFSXX4UXDX55XRIDQZS6LPR4OJXKIIGSZS56CQ.6O4WUAUHFUAHSTEYRWJX6DDO7TL2IBLC7EV2LS4EHWZOOEPCEUOA"
+device_id = "lht65n-01-temp-humidity-sensor"
+app_id = "bd-test-app2"
 
-THINGSPEAK_WRITE_API_KEY = "CJ2P7Y9ETTAEPQWM"
-THINGSPEAK_URL = "https://api.thingspeak.com/update"
-# ====================================================
+csv_file = "sensor_data.csv"
 
-# ---------- Helper: Map telemetry to ThingSpeak fields ----------
-def map_to_thingspeak_fields(telemetry):
-    mapping = {
-        "temperature": "field1",
-        "humidity": "field2",
-        "motion": "field3",
-        "battery": "field4",
-        "pred_temperature": "field5",
-        "pred_humidity": "field6",
-        "pred_motion": "field7",
-        "pred_custom": "field8",
-    }
-    data = {"api_key": THINGSPEAK_WRITE_API_KEY}
-    for key, field in mapping.items():
-        value = telemetry.get(key)
-        if value is not None:
-            data[field] = value
-    
-    # Include original TTN timestamp if available
-    if "timestamp" in telemetry and telemetry["timestamp"]:
-        data["created_at"] = telemetry["timestamp"]
-    
-    return data
+# ===== FILEBASE CONFIGURATION =====
+FILEBASE_BUCKET = "iot-data"
+FILEBASE_ACCESS_KEY = "5EBB915AC86F860E876D"
+FILEBASE_SECRET_KEY = "UgS97WjaIqDwaI4b2NdUKc6p8qeloEUuw77vGKUD"
+FILEBASE_REGION = "us-east-1"  # default region for Filebase
+# ==================================
 
-# ---------- Send data to ThingSpeak ----------
-def send_to_thingspeak(telemetry):
+# ---------- Convert UTC → Uganda Time ----------
+def to_uganda_time(utc_str):
+    utc_dt = datetime.fromisoformat(utc_str.replace("Z", "+00:00"))
+    uganda_tz = pytz.timezone("Africa/Kampala")
+    return utc_dt.astimezone(uganda_tz)
+
+# ---------- Ensure CSV has headers ----------
+if not os.path.exists(csv_file):
+    with open(csv_file, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Time (Uganda)", "Battery", "Humidity", "Motion", "Temperature"])
+
+# ---------- Load existing timestamps ----------
+def load_existing_timestamps():
+    if not os.path.exists(csv_file):
+        return set()
+    with open(csv_file, "r") as f:
+        return {row.split(",")[0] for row in f.readlines()[1:]}
+existing_times = load_existing_timestamps()
+
+# ---------- Get latest timestamp in CSV ----------
+def get_latest_timestamp():
+    if not os.path.exists(csv_file):
+        return None
+    with open(csv_file, "r") as f:
+        lines = f.readlines()
+        if len(lines) > 1:
+            last_line = lines[-1].strip()
+            if last_line:
+                return last_line.split(",")[0]
+    return None
+
+# ---------- Upload to Filebase ----------
+def upload_to_filebase():
     try:
-        data = map_to_thingspeak_fields(telemetry)
-        response = requests.post(THINGSPEAK_URL, params=data)
-        if response.status_code not in [200, 201]:
-            print("Failed to send to ThingSpeak:", response.status_code, response.text)
-        else:
-            print("Sent to ThingSpeak:", data)
+        s3 = boto3.client(
+            "s3",
+            endpoint_url="https://s3.filebase.com",
+            aws_access_key_id=FILEBASE_ACCESS_KEY,
+            aws_secret_access_key=FILEBASE_SECRET_KEY,
+            region_name=FILEBASE_REGION,
+        )
+        s3.upload_file(csv_file, FILEBASE_BUCKET, os.path.basename(csv_file))
+        print("☁️ Uploaded latest CSV to Filebase successfully.")
     except Exception as e:
-        print("Error sending to ThingSpeak:", e)
+        print("⚠️ Error uploading to Filebase:", e)
 
-# ---------- Fetch historical TTN data ----------
-def fetch_historical_data(hours=20, delay=15):
-    tz = pytz.timezone("Africa/Kampala")
-    now = datetime.now(tz)
-    start_time = now - timedelta(hours=hours)
-    end_time = now
+# ---------- Save one record ----------
+def save_to_csv(time_str, battery, humidity, motion, temperature):
+    if time_str not in existing_times:
+        with open(csv_file, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([time_str, battery, humidity, motion, temperature])
+        existing_times.add(time_str)
+        print(f"Saved record @ {time_str}")
 
-    start_utc = start_time.astimezone(pytz.utc).isoformat()
-    end_utc = end_time.astimezone(pytz.utc).isoformat()
+        # Upload to Filebase after saving a new record
+        upload_to_filebase()
+    else:
+        print(f"Skipped duplicate @ {time_str}")
 
-    url = f"https://{TTN_BROKER}/api/v3/as/applications/{APP_ID}/devices/{DEVICE_ID}/packages/storage/uplink_message"
-    headers = {"Authorization": f"Bearer {TTN_PASSWORD}"}
-    params = {
-        "after": start_utc,
-        "before": end_utc,
-        "format": "json",
-        "order": "received_at"
-    }
+# ---------- Fetch historical data (optimized) ----------
+def get_historical_sensor_data():
+    latest_saved = get_latest_timestamp()
+    headers = {"Authorization": f"Bearer {password}"}
+    url = f"https://{broker}/api/v3/as/applications/{app_id}/devices/{device_id}/packages/storage/uplink_message"
+
+    params = {"format": "json", "order": "received_at"}
+    if latest_saved:
+        # Convert last local timestamp → UTC ISO for TTN
+        uganda_tz = pytz.timezone("Africa/Kampala")
+        last_local_dt = uganda_tz.localize(datetime.strptime(latest_saved, "%Y-%m-%d %H:%M:%S"))
+        last_utc = last_local_dt.astimezone(pytz.utc)
+        params["after"] = last_utc.isoformat()
+        print(f"Fetching data after {params['after']}")
+    else:
+        params["last"] = "48h"
+        print("No previous data found → Fetching last 48 hours")
 
     response = requests.get(url, headers=headers, params=params)
     if response.status_code == 200:
-        results = []
-        for line in response.text.strip().splitlines():
+        lines = response.text.strip().splitlines()
+        for line in lines:
             try:
-                msg = json.loads(line)
-                results.append(msg)
-            except json.JSONDecodeError:
-                print("Skipped invalid line in TTN response")
-
-        print(f"Fetched {len(results)} historical messages.")
-
-        for i, msg in enumerate(results):
-            uplink = msg.get("result", {}).get("uplink_message", {})
-            decoded = uplink.get("decoded_payload", {})
-            timestamp = msg.get("result", {}).get("received_at")
-
-            if decoded:
-                telemetry = {
-                    "temperature": decoded.get("field5"),
-                    "humidity": decoded.get("field3"),
-                    "motion": decoded.get("field4"),
-                    "battery": decoded.get("field1"),
-                    "timestamp": timestamp,
-                    "pred_temperature": None,
-                    "pred_humidity": None,
-                    "pred_motion": None,
-                    "pred_custom": None
-                }
-                print("DEBUG decoded_payload:", telemetry)
-                send_to_thingspeak(telemetry)
-            else:
-                print(f"No decoded payload for message {i+1}")
-
-            time.sleep(delay)
+                data = json.loads(line)["result"]
+                payload = data["uplink_message"]["decoded_payload"]
+                timestamp = to_uganda_time(data["received_at"]).strftime("%Y-%m-%d %H:%M:%S")
+                save_to_csv(
+                    timestamp,
+                    payload.get("field1"),
+                    payload.get("field3"),
+                    payload.get("field4"),
+                    payload.get("field5")
+                )
+            except Exception as e:
+                print("Error decoding record:", e)
+        print("Historical fetch complete ✅")
     else:
         print("Error fetching historical data:", response.status_code, response.text)
 
-# ---------- MQTT Callbacks ----------
-TOPIC = f"v3/{TTN_USERNAME}/devices/{DEVICE_ID}/up"
+# ---------- MQTT callbacks ----------
+topic = f"v3/{username}/devices/{device_id}/up"
 
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
         print("Connected to TTN MQTT broker!")
-        client.subscribe(TOPIC)
+        client.subscribe(topic)
     else:
-        print(f"Failed to connect, return code {rc}")
+        print("Failed to connect, code:", rc)
 
 def on_message(client, userdata, msg):
-    payload = json.loads(msg.payload.decode())
-    uplink = payload.get("uplink_message", {})
-    decoded = uplink.get("decoded_payload", {})
-    timestamp = payload.get("received_at") or uplink.get("received_at")
+    try:
+        payload = json.loads(msg.payload.decode())
+        decoded = payload["uplink_message"]["decoded_payload"]
+        timestamp = to_uganda_time(payload["received_at"]).strftime("%Y-%m-%d %H:%M:%S")
+        save_to_csv(
+            timestamp,
+            decoded.get("field1"),
+            decoded.get("field3"),
+            decoded.get("field4"),
+            decoded.get("field5")
+        )
+    except Exception as e:
+        print("Error handling live message:", e)
 
-    if decoded:
-        telemetry = {
-            "temperature": decoded.get("field5"),
-            "humidity": decoded.get("field3"),
-            "motion": decoded.get("field4"),
-            "battery": decoded.get("field1"),
-            "timestamp": timestamp,
-            "pred_temperature": None,
-            "pred_humidity": None,
-            "pred_motion": None,
-            "pred_custom": None
-        }
-        threading.Thread(target=lambda: [send_to_thingspeak(telemetry), time.sleep(15)]).start()
-        print("DEBUG live decoded_payload:", telemetry)
-    else:
-        print("No decoded payload in live message")
-
-# ---------- Main ----------
+# ---------- MAIN ----------
 if __name__ == "__main__":
+    print("Starting script...\n")
+    get_historical_sensor_data()   # Catch up first
+    print("\nNow listening for real-time data...\n")
+
     client = mqtt.Client()
-    client.username_pw_set(TTN_USERNAME, TTN_PASSWORD)
+    client.username_pw_set(username, password)
     client.on_connect = on_connect
     client.on_message = on_message
-    client.connect(TTN_BROKER, TTN_PORT, 60)
-
-    client.loop_start()
-    last_historical_day = None
-
-    try:
-        while True:
-            tz = pytz.timezone("Africa/Kampala")
-            now = datetime.now(tz)
-
-            # Fetch historical data once per day
-            if last_historical_day != now.day:
-                print("Fetching historical TTN data...")
-                fetch_historical_data(hours=20, delay=15)
-                last_historical_day = now.day
-
-            time.sleep(60)
-    except KeyboardInterrupt:
-        client.loop_stop()
-        print("Script stopped.")
+    client.connect(broker, port, 60)
+    client.loop_forever()
