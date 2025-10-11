@@ -1,0 +1,32 @@
+# ===== Python =====
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+*.db
+.env
+.env.*
+venv/
+my_env/
+.envrc
+.DS_Store
+
+# ===== Node / React =====
+node_modules/
+dist/
+build/
+*.log
+.env
+.env.local
+.env.development
+.env.production
+
+# ===== VSCode & IDEs =====
+.vscode/
+.idea/
+*.swp
+
+# ===== OS / System =====
+Thumbs.db
+.DS_Store
