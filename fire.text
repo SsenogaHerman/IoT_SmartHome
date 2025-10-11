@@ -1,0 +1,563 @@
+# Firebase → Auto-train ML pipeline + React dashboard
+
+This document shows a complete, practical approach to: **fetch sensor CSV from Firebase Storage**, **auto-train models when new data arrives (or on a schedule)**, **generate analytics (humidity/battery/temperature + anomaly detection + short-term forecast)**, and **serve results to a React dashboard**.
+
+It includes:
+
+* Architecture overview
+* Prerequisites & setup
+* Full backend implementation (FastAPI + polling downloader + model training + REST endpoints)
+* A simple React dashboard app (single-file examples) that calls the backend and shows charts
+* Deployment notes & next steps
+
+---
+
+## Architecture (simple, robust)
+
+1. **Firebase Storage**: your CSV `sensor_data.csv` is stored here and keeps growing.
+2. **Backend service (Python, FastAPI)**: periodically downloads the CSV, finds new rows, appends to a local Parquet/CSV store, runs cleaning, trains/updates models (temperature regressor + anomaly detector), exposes REST API endpoints for analytics, anomalies, and predictions.
+3. **Frontend (React)**: calls backend endpoints to show live analytics, recent anomalies, and predictions in charts.
+
+Alternative (recommended long-term): store sensor readings in Firestore or Realtime Database instead of appending to a CSV — this enables real real-time event-driven processing with Cloud Functions. But the below works with CSV in Storage.
+
+---
+
+## Prerequisites
+
+* Python 3.9+
+* A Firebase project and service account JSON (for server access to Firebase Storage)
+* Node.js 18+ for the React dashboard
+
+Install Python packages (example):
+
+```bash
+python -m venv venv
+source venv/bin/activate
+pip install fastapi uvicorn pandas numpy scikit-learn joblib google-cloud-storage apscheduler python-dotenv
+```
+
+React deps (in the frontend folder):
+
+```bash
+npx create-react-app dashboard
+cd dashboard
+npm install axios chart.js react-chartjs-2
+```
+
+---
+
+## Backend: overview
+
+Files provided below (single-file here for simplicity): `backend/main.py` — does:
+
+* load Firebase service account from `GOOGLE_APPLICATION_CREDENTIALS` env var (standard for google-cloud-storage)
+* downloads `sensor_data.csv` from a configured bucket/path
+* keeps a local `data/sensor_data.parquet` as canonical cleaned dataset
+* on detecting new rows, runs `process_and_train()` which cleans and trains:
+
+  * IsolationForest anomaly detector
+  * RandomForest regressor to predict next temperature reading
+* exposes endpoints:
+
+  * `GET /health`
+  * `GET /analytics` — returns summary stats and correlations
+  * `GET /anomalies` — returns recent anomaly rows
+  * `GET /predict` — returns model prediction for latest reading
+* has a scheduler (APScheduler) to poll Firebase Storage every N minutes (configurable)
+
+---
+
+### backend/main.py
+
+```python
+# backend/main.py
+import os
+import io
+import time
+import math
+import json
+import joblib
+import logging
+from datetime import datetime
+from typing import Dict, Any
+
+import pandas as pd
+import numpy as np
+from fastapi import FastAPI
+from pydantic import BaseModel
+from apscheduler.schedulers.background import BackgroundScheduler
+from sklearn.ensemble import RandomForestRegressor, IsolationForest
+from sklearn.preprocessing import StandardScaler
+from google.cloud import storage
+
+# CONFIG - set via env vars or hardcode for testing
+BUCKET_NAME = os.getenv('FIREBASE_BUCKET')  # e.g. 'your-app.appspot.com'
+BLOB_PATH = os.getenv('FIREBASE_BLOB_PATH', 'sensor_data.csv')
+LOCAL_CANONICAL = os.getenv('LOCAL_CANONICAL', 'data/sensor_data.parquet')
+POLL_MINUTES = int(os.getenv('POLL_MINUTES', '5'))
+MODEL_DIR = os.getenv('MODEL_DIR', 'models')
+os.makedirs('data', exist_ok=True)
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title='Sensor ML API')
+
+# helper: download CSV contents from firebase storage
+def download_csv_from_storage(bucket_name: str, blob_path: str) -> str:
+    client = storage.Client()  # requires GOOGLE_APPLICATION_CREDENTIALS
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_path)
+    content = blob.download_as_text(encoding='utf-8')
+    return content
+
+# parse & clean function (similar to earlier pipeline)
+def clean_df(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    # normalize name
+    df.columns = [c.strip() for c in df.columns]
+    # find time col
+    time_col_candidates = ['Time (Uganda)','Time','timestamp','Datetime','time']
+    tcol = None
+    for c in time_col_candidates:
+        if c in df.columns:
+            tcol = c
+            break
+    if tcol is None:
+        raise ValueError('No time column found')
+    df = df.rename(columns={tcol: 'time'})
+    df['time'] = pd.to_datetime(df['time'], errors='coerce')
+    df = df.dropna(subset=['time'])
+    # numeric conversions
+    for col in ['Battery','Humidity','Motion','Temperature']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    # sort
+    df = df.sort_values('time').reset_index(drop=True)
+    # interpolate
+    df = df.set_index('time')
+    num_cols = [c for c in ['Battery','Humidity','Motion','Temperature'] if c in df.columns]
+    if num_cols:
+        df[num_cols] = df[num_cols].interpolate(method='time', limit_direction='both')
+        for c in num_cols:
+            if df[c].isna().any():
+                df[c].fillna(df[c].median(), inplace=True)
+    df = df.reset_index()
+    return df
+
+# load canonical local data
+def load_local() -> pd.DataFrame:
+    if os.path.exists(LOCAL_CANONICAL):
+        return pd.read_parquet(LOCAL_CANONICAL)
+    return pd.DataFrame()
+
+# save canonical
+def save_local(df: pd.DataFrame):
+    df.to_parquet(LOCAL_CANONICAL, index=False)
+
+# update pipeline: fetch, detect new rows, append, train
+def process_and_train():
+    logger.info('Polling storage for new CSV...')
+    try:
+        raw = download_csv_from_storage(BUCKET_NAME, BLOB_PATH)
+    except Exception as e:
+        logger.exception('Failed to download CSV: %s', e)
+        return
+
+    # read CSV
+    df_remote = pd.read_csv(io.StringIO(raw))
+    df_clean = clean_df(df_remote)
+
+    # load local canonical and find new rows by time
+    df_local = load_local()
+    if df_local.empty:
+        merged = df_clean
+        new_rows = len(df_clean)
+    else:
+        # assume time column exists and is sorted
+        last_time = pd.to_datetime(df_local['time']).max()
+        new_mask = pd.to_datetime(df_clean['time']) > last_time
+        merged = pd.concat([df_local, df_clean[new_mask]], ignore_index=True).sort_values('time').reset_index(drop=True)
+        new_rows = new_mask.sum()
+
+    if new_rows == 0:
+        logger.info('No new rows found.')
+    else:
+        logger.info('Found %d new rows — updating local data and retraining', new_rows)
+        save_local(merged)
+        # retrain models
+        train_and_save_models(merged)
+
+# training function
+def train_and_save_models(df: pd.DataFrame):
+    # Feature engineering similar to prior
+    df = df.sort_values('time').reset_index(drop=True)
+    # compute battery drop & time diffs
+    df['battery_drop'] = df['Battery'].diff().fillna(0)
+    df['time_diff_minutes'] = pd.to_datetime(df['time']).diff().dt.total_seconds().div(60).fillna(0)
+    df['battery_drop_per_min'] = df['battery_drop'] / df['time_diff_minutes'].replace(0, np.nan)
+    df['battery_drop_per_min'].fillna(0, inplace=True)
+
+    # Anomaly model
+    anom_features = [c for c in ['Battery','Humidity','Motion','Temperature','battery_drop_per_min'] if c in df.columns]
+    X_anom = df[anom_features].fillna(0).values
+    if len(X_anom) >= 10:
+        anom = IsolationForest(n_estimators=200, contamination=0.02, random_state=42)
+        anom.fit(X_anom)
+        joblib.dump(anom, os.path.join(MODEL_DIR, 'anomaly_iforest.joblib'))
+        logger.info('Saved anomaly model')
+    # Temp forecasting model (next-reading)
+    df_sup = df.copy()
+    df_sup['temp_target_next'] = df_sup['Temperature'].shift(-1)
+    for lag in [1,2,3]:
+        df_sup[f'temp_lag_{lag}'] = df_sup['Temperature'].shift(lag)
+        df_sup[f'motion_lag_{lag}'] = df_sup['Motion'].shift(lag)
+        df
+```
+Thanks — I tried to create a single canvas document with the full plan + code but the canvas creation failed. No files were created. I’ll paste everything here instead: clear instructions, the backend (FastAPI) code, requirements, and a React dashboard example you can drop into a Create-React-App. You can run these locally or deploy to a server.
+
+Short summary of the approach
+
+Backend (Python + FastAPI) polls Firebase Storage for sensor_data.csv, downloads it, cleans it, appends any new rows to a canonical local store, retrains two models when new data arrives:
+
+IsolationForest anomaly detector
+
+RandomForest regressor to predict the next temperature reading
+
+Backend exposes REST endpoints: /analytics, /anomalies, /predict, /ingest (manual trigger).
+
+Frontend (React) calls the backend endpoints and shows summary, recent anomalies, and prediction.
+
+Long-term: switch to Firestore/Realtime DB + Cloud Functions for event-driven processing — recommended but optional.
+
+Prereqs & env setup (quick)
+
+Create a Python venv and install:
+
+Thanks — I tried to create a single canvas document with the full plan + code but the canvas creation failed. No files were created. I’ll paste everything here instead: clear instructions, the backend (FastAPI) code, requirements, and a React dashboard example you can drop into a Create-React-App. You can run these locally or deploy to a server.
+
+Short summary of the approach
+
+Backend (Python + FastAPI) polls Firebase Storage for sensor_data.csv, downloads it, cleans it, appends any new rows to a canonical local store, retrains two models when new data arrives:
+
+IsolationForest anomaly detector
+
+RandomForest regressor to predict the next temperature reading
+
+Backend exposes REST endpoints: /analytics, /anomalies, /predict, /ingest (manual trigger).
+
+Frontend (React) calls the backend endpoints and shows summary, recent anomalies, and prediction.
+
+Long-term: switch to Firestore/Realtime DB + Cloud Functions for event-driven processing — recommended but optional.
+
+Prereqs & env setup (quick)
+
+Create a Python venv and install:
+python -m venv venv
+source venv/bin/activate
+pip install fastapi uvicorn pandas numpy scikit-learn joblib google-cloud-storage apscheduler python-dotenv
+
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/serviceAccountKey.json"
+export FIREBASE_BUCKET="your-project.appspot.com"         # your bucket name
+export FIREBASE_BLOB_PATH="sensor_data.csv"              # path in bucket
+export POLL_MINUTES=5                                    # how often to poll
+
+npx create-react-app dashboard
+cd dashboard
+npm install axios chart.js react-chartjs-2
+# in package.json add: "proxy": "http://localhost:8000"  (so /api calls go to backend)
+
+uvicorn backend.main:app --reload --port 8000
+
+# backend/main.py
+import os, io, logging, joblib
+from datetime import datetime
+from typing import List
+import pandas as pd
+import numpy as np
+
+from fastapi import FastAPI
+from apscheduler.schedulers.background import BackgroundScheduler
+from sklearn.ensemble import RandomForestRegressor, IsolationForest
+from sklearn.preprocessing import StandardScaler
+from google.cloud import storage
+
+# CONFIG (via env vars)
+BUCKET_NAME = os.getenv('FIREBASE_BUCKET')            # e.g. 'your-project.appspot.com'
+BLOB_PATH = os.getenv('FIREBASE_BLOB_PATH', 'sensor_data.csv')
+LOCAL_CANONICAL = os.getenv('LOCAL_CANONICAL', 'data/sensor_data.parquet')
+POLL_MINUTES = int(os.getenv('POLL_MINUTES', '5'))
+MODEL_DIR = os.getenv('MODEL_DIR', 'models')
+
+os.makedirs('data', exist_ok=True)
+os.makedirs(MODEL_DIR, exist_ok=True)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="Sensor ML API")
+
+def download_csv_from_storage(bucket_name: str, blob_path: str) -> str:
+    """Download CSV text from Firebase Storage using google-cloud-storage client."""
+    client = storage.Client()  # relies on GOOGLE_APPLICATION_CREDENTIALS env var
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_path)
+    content = blob.download_as_text(encoding='utf-8')
+    return content
+
+def clean_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Canonical cleaning for this dataset."""
+    df = df.copy()
+    df.columns = [c.strip() for c in df.columns]
+    time_col_candidates = ['Time (Uganda)','Time','timestamp','Datetime','time']
+    tcol = next((c for c in time_col_candidates if c in df.columns), None)
+    if tcol is None:
+        raise ValueError("No time column found")
+    df = df.rename(columns={tcol: 'time'})
+    df['time'] = pd.to_datetime(df['time'], errors='coerce')
+    df = df.dropna(subset=['time'])
+    for col in ['Battery','Humidity','Motion','Temperature']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    df = df.sort_values('time').reset_index(drop=True)
+    # interpolate numeric columns using datetime index
+    df = df.set_index('time')
+    num_cols = [c for c in ['Battery','Humidity','Motion','Temperature'] if c in df.columns]
+    if num_cols:
+        df[num_cols] = df[num_cols].interpolate(method='time', limit_direction='both')
+        for c in num_cols:
+            if df[c].isna().any():
+                df[c].fillna(df[c].median(), inplace=True)
+    df = df.reset_index()
+    return df
+
+def load_local() -> pd.DataFrame:
+    if os.path.exists(LOCAL_CANONICAL):
+        return pd.read_parquet(LOCAL_CANONICAL)
+    return pd.DataFrame()
+
+def save_local(df: pd.DataFrame):
+    df.to_parquet(LOCAL_CANONICAL, index=False)
+
+def train_and_save_models(df: pd.DataFrame):
+    """Train anomaly detector and temp regressor; save models."""
+    df = df.sort_values('time').reset_index(drop=True)
+    # feature engineering
+    df['battery_drop'] = df['Battery'].diff().fillna(0)
+    df['time_diff_minutes'] = pd.to_datetime(df['time']).diff().dt.total_seconds().div(60).fillna(0)
+    df['battery_drop_per_min'] = df['battery_drop'] / df['time_diff_minutes'].replace(0, np.nan)
+    df['battery_drop_per_min'].fillna(0, inplace=True)
+
+    # Anomaly model
+    anom_features = [c for c in ['Battery','Humidity','Motion','Temperature','battery_drop_per_min'] if c in df.columns]
+    X_anom = df[anom_features].fillna(0).values
+    if len(X_anom) >= 10:
+        anom = IsolationForest(n_estimators=200, contamination=0.02, random_state=42)
+        anom.fit(X_anom)
+        joblib.dump(anom, os.path.join(MODEL_DIR, 'anomaly_iforest.joblib'))
+        logger.info("Saved anomaly model")
+
+    # Temperature next-reading model
+    df_sup = df.copy()
+    df_sup['temp_target_next'] = df_sup['Temperature'].shift(-1)
+    for lag in [1,2,3]:
+        df_sup[f'temp_lag_{lag}'] = df_sup['Temperature'].shift(lag)
+        df_sup[f'motion_lag_{lag}'] = df_sup['Motion'].shift(lag)
+        df_sup[f'battery_lag_{lag}'] = df_sup['Battery'].shift(lag)
+    df_model = df_sup.dropna(subset=['temp_target_next','temp_lag_1','temp_lag_2','temp_lag_3'])
+    if len(df_model) >= 20:
+        feature_cols = ['temp_lag_1','temp_lag_2','temp_lag_3','motion_lag_1','battery_lag_1']
+        X = df_model[feature_cols].values
+        y = df_model['temp_target_next'].values
+        scaler = StandardScaler()
+        Xs = scaler.fit_transform(X)
+        rf = RandomForestRegressor(n_estimators=200, random_state=42)
+        rf.fit(Xs, y)
+        joblib.dump(rf, os.path.join(MODEL_DIR,'temp_rf_model.joblib'))
+        joblib.dump(scaler, os.path.join(MODEL_DIR,'temp_scaler.joblib'))
+        logger.info("Saved temperature model and scaler")
+    else:
+        logger.info("Not enough data to train temperature model yet")
+
+def process_and_train():
+    """Download CSV, detect new rows, update local store, and retrain if new data found."""
+    logger.info("Polling storage for CSV...")
+    try:
+        raw = download_csv_from_storage(BUCKET_NAME, BLOB_PATH)
+    except Exception as e:
+        logger.exception("Failed downloading CSV: %s", e)
+        return
+    df_remote = pd.read_csv(io.StringIO(raw))
+    df_clean = clean_df(df_remote)
+    df_local = load_local()
+    if df_local.empty:
+        merged = df_clean
+        new_rows = len(df_clean)
+    else:
+        last_time = pd.to_datetime(df_local['time']).max()
+        mask_new = pd.to_datetime(df_clean['time']) > last_time
+        merged = pd.concat([df_local, df_clean[mask_new]], ignore_index=True).sort_values('time').reset_index(drop=True)
+        new_rows = mask_new.sum()
+    if new_rows == 0:
+        logger.info("No new rows.")
+    else:
+        logger.info("Found %d new rows. Saving and retraining.", new_rows)
+        save_local(merged)
+        train_and_save_models(merged)
+
+def get_models():
+    models = {}
+    try:
+        if os.path.exists(os.path.join(MODEL_DIR,'anomaly_iforest.joblib')):
+            models['anom'] = joblib.load(os.path.join(MODEL_DIR,'anomaly_iforest.joblib'))
+        if os.path.exists(os.path.join(MODEL_DIR,'temp_rf_model.joblib')):
+            models['temp_rf'] = joblib.load(os.path.join(MODEL_DIR,'temp_rf_model.joblib'))
+        if os.path.exists(os.path.join(MODEL_DIR,'temp_scaler.joblib')):
+            models['scaler'] = joblib.load(os.path.join(MODEL_DIR,'temp_scaler.joblib'))
+    except Exception as e:
+        logger.exception("Error loading models: %s", e)
+    return models
+
+@app.on_event("startup")
+def startup_event():
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(process_and_train, 'interval', minutes=POLL_MINUTES, next_run_time=datetime.now())
+    scheduler.start()
+    app.state.scheduler = scheduler
+    logger.info("Scheduler started, polling every %s minutes", POLL_MINUTES)
+
+@app.get("/health")
+def health():
+    return {"status":"ok"}
+
+@app.get("/analytics")
+def analytics():
+    df = load_local()
+    if df.empty:
+        return {"error":"no local data yet"}
+    resp = {}
+    resp['summary'] = df[['Battery','Humidity','Motion','Temperature']].describe().to_dict()
+    resp['correlations'] = df[['Battery','Humidity','Motion','Temperature']].corr().to_dict()
+    total_minutes = (pd.to_datetime(df['time']).max() - pd.to_datetime(df['time']).min()).total_seconds()/60.0
+    resp['battery_median'] = float(df['Battery'].median())
+    if total_minutes > 0:
+        resp['battery_drop_total'] = float(df['Battery'].iloc[0] - df['Battery'].iloc[-1])
+        resp['battery_drop_per_hour'] = float((df['Battery'].iloc[0] - df['Battery'].iloc[-1])/(total_minutes/60.0))
+    return resp
+
+@app.get("/anomalies")
+def anomalies(limit: int = 100):
+    df = load_local()
+    if df.empty:
+        return {"error":"no data"}
+    models = get_models()
+    if 'anom' not in models:
+        return {"error":"no anomaly model ready"}
+    anom = models['anom']
+    anom_feats = [c for c in ['Battery','Humidity','Motion','Temperature','battery_drop_per_min'] if c in df.columns]
+    X = df[anom_feats].fillna(0).values
+    preds = anom.predict(X)
+    df2 = df.copy()
+    df2['anomaly'] = preds
+    out = df2[df2['anomaly'] == -1].sort_values('time', ascending=False).head(limit)
+    return out.to_dict(orient='records')
+
+@app.get("/predict")
+def predict():
+    df = load_local()
+    if df.empty:
+        return {"error":"no data"}
+    models = get_models()
+    if 'temp_rf' not in models or 'scaler' not in models:
+        return {"error":"temp model not ready"}
+    rf = models['temp_rf']; scaler = models['scaler']
+    latest = df.sort_values('time').iloc[-3:]
+    if len(latest) < 3:
+        return {"error":"not enough history"}
+    feat = np.array([latest['Temperature'].values[-1], latest['Temperature'].values[-2], latest['Temperature'].values[-3],
+                     latest['Motion'].values[-1], latest['Battery'].values[-1]]).reshape(1,-1)
+    feat_s = scaler.transform(feat)
+    pred = rf.predict(feat_s)[0]
+    return {"predicted_next_temperature": float(pred)}
+
+@app.post("/ingest")
+def manual_ingest():
+    process_and_train()
+    return {"status":"ingest_triggered"}
+
+
+// src/App.jsx
+import React, { useEffect, useState } from 'react';
+import axios from 'axios';
+
+function App(){
+  const [analytics, setAnalytics] = useState(null);
+  const [anomalies, setAnomalies] = useState([]);
+  const [prediction, setPrediction] = useState(null);
+
+  useEffect(()=> { fetchAll() }, []);
+
+  async function fetchAll(){
+    try{
+      const a = await axios.get('/analytics');
+      setAnalytics(a.data);
+      const an = await axios.get('/anomalies');
+      setAnomalies(Array.isArray(an.data) ? an.data : []);
+      const p = await axios.get('/predict');
+      setPrediction(p.data);
+    }catch(e){
+      console.error('fetch error', e);
+    }
+  }
+
+  return (
+    <div style={{padding:20, fontFamily:'Arial'}}>
+      <h1>Sensor Dashboard</h1>
+      <button onClick={fetchAll}>Refresh</button>
+
+      <section style={{marginTop:20}}>
+        <h2>Summary</h2>
+        {analytics ? <pre>{JSON.stringify(analytics, null, 2)}</pre> : <p>Loading...</p>}
+      </section>
+
+      <section style={{marginTop:20}}>
+        <h2>Prediction</h2>
+        {prediction?.predicted_next_temperature ? (
+          <div>Predicted next temperature: {prediction.predicted_next_temperature.toFixed(2)} °C</div>
+        ) : <p>Prediction not ready</p>}
+      </section>
+
+      <section style={{marginTop:20}}>
+        <h2>Recent Anomalies</h2>
+        <table border="1" cellPadding="6">
+          <thead><tr><th>time</th><th>Battery</th><th>Humidity</th><th>Motion</th><th>Temp</th></tr></thead>
+          <tbody>
+            {anomalies.map((r,i) => (
+              <tr key={i}>
+                <td>{r.time}</td>
+                <td>{r.Battery}</td>
+                <td>{r.Humidity}</td>
+                <td>{r.Motion}</td>
+                <td>{r.Temperature}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </section>
+    </div>
+  );
+}
+
+export default App;
+Notes, optimizations & follow-ups
+
+Polling vs event-driven: Polling is easy to implement but not instant. If you can, change your ingestion to write each sensor reading to Firestore/Realtime DB — then use Cloud Functions (or Cloud Run with Pub/Sub) to trigger training/analytics immediately.
+
+Model retrain strategy: retrain on new data every N minutes or when N new rows arrive. Save model versions and evaluate drift.
+
+Prediction targets: I used next-reading Temperature. If you want to predict rain you’ll need a target label (e.g., rain/no-rain) derived from external weather data (or local thresholds). If you can provide a label (past rainfall), we can train a classifier.
+
+Alerts: Add an endpoint that posts to Twilio/email when anomaly or battery drop threshold is met.
+
+Security: Keep GOOGLE_APPLICATION_CREDENTIALS private. Protect API with auth if exposing publicly.
